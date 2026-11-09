@@ -1,13 +1,20 @@
 name: Tests
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run regex (exported as TESTCASE for test.sh)"
+        required: false
+        default: ""
+        type: string
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         target:
-        - linux-amd64-fmt
         - linux-amd64-integration-1-cpu
         - linux-amd64-integration-2-cpu
         - linux-amd64-integration-4-cpu
@@ -22,7 +29,9 @@ jobs:
     - run: date
     - env:
         TARGET: ${{ matrix.target }}
+        TEST_FILTER: ${{ inputs.test-filter }}
       run: |
+        if [ -n "${TEST_FILTER}" ]; then export TESTCASE="${TEST_FILTER}"; fi
         echo "${TARGET}"
         case "${TARGET}" in
           linux-amd64-fmt)
@@ -58,3 +67,105 @@ jobs:
             exit 1
             ;;
         esac
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-go@v5
+      with:
+        go-version: "1.24.0"
+    - name: Build go.etcd.io/etcd/client/pkg/v3 module zip
+      run: |
+        mkdir -p "${RUNNER_TEMP}/ziphelper" "${RUNNER_TEMP}/out"
+        cd "${RUNNER_TEMP}/ziphelper"
+        cat > main.go <<'GOEOF'
+        package main
+
+        import (
+            "log"
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+        )
+
+        func main() {
+            f, err := os.Create(os.Args[1])
+            if err != nil {
+                log.Fatal(err)
+            }
+            defer f.Close()
+            mv := module.Version{Path: "go.etcd.io/etcd/client/pkg/v3", Version: "v3.5.1"}
+            if err := zip.CreateFromDir(f, mv, os.Args[2]); err != nil {
+                log.Fatal(err)
+            }
+        }
+        GOEOF
+        go mod init ziphelper
+        go get golang.org/x/mod@v0.24.0
+        go run . "${RUNNER_TEMP}/out/v3.5.1.zip" "${GITHUB_WORKSPACE}/client/pkg"
+        unzip -l "${RUNNER_TEMP}/out/v3.5.1.zip"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: module-zip
+        path: ${{ runner.temp }}/out/v3.5.1.zip
+        if-no-files-found: error
+  test-xplat:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        # macos-latest is arm64: Go 1.16's linker emits no LC_UUID, which current
+        # macOS dyld rejects, so this leg uses Go 1.23 (+ -checklinkname=0 for the
+        # 2021 x/sys linknames).
+        - os: macos-latest
+          go: "1.23"
+          ldflags: "-checklinkname=0"
+          skip: ""
+        - os: windows-latest
+          go: "1.16.3"
+          ldflags: ""
+          # Windows-incompatible tests (POSIX file locking/unlink semantics,
+          # SO_REUSEPORT, POSIX error strings, write-side i/o timeouts).
+          skip: "TestFileBufReader|TestLockAndUnlock|TestPurgeFileHoldingLockFile|TestNewListenerWithSocketOpts|TestTLSInfoNonexist|TestReadWriteTimeoutDialer|TestWriteReadTimeoutListener"
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go }}
+    - name: go test client/pkg
+      shell: bash
+      working-directory: client/pkg
+      env:
+        SKIP_REGEX: ${{ matrix.skip }}
+        LDFLAGS: ${{ matrix.ldflags }}
+        TEST_FILTER: ${{ inputs.test-filter }}
+      run: |
+        set -euo pipefail
+        go version
+        # Go 1.16 has no `go test -skip`: per package, list the tests and run
+        # every test not matched by SKIP_REGEX via an explicit -run allowlist.
+        rc=0
+        for pkg in $(go list ./...); do
+          args=(-v)
+          if [ -n "${LDFLAGS}" ]; then args+=("-ldflags=${LDFLAGS}"); fi
+          if [ -n "${TEST_FILTER}" ]; then
+            args+=("-run=${TEST_FILTER}")
+          elif [ -n "${SKIP_REGEX}" ]; then
+            all=$(go test -list '.*' "$pkg" | awk '/^(Test|Example)/')
+            kept=$(echo "$all" | awk -v re="^(${SKIP_REGEX})$" 'NF && $0 !~ re' | paste -sd'|' -)
+            skipped=$(echo "$all" | awk -v re="^(${SKIP_REGEX})$" 'NF && $0 ~ re')
+            if [ -n "$skipped" ]; then
+              echo "SKIPPED on ${RUNNER_OS} in $pkg (Windows-incompatible): $(echo $skipped)"
+            fi
+            if [ -z "$kept" ]; then
+              echo "no runnable tests left in $pkg"; continue
+            fi
+            args+=("-run=^(${kept})\$")
+          fi
+          go test "${args[@]}" "$pkg" || rc=1
+        done
+        exit $rc

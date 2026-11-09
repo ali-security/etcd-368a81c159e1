@@ -22,6 +22,11 @@ import (
 )
 
 func TestBeforeTestWithoutLeakDetection(t *testing.T) {
+	if testing.Short() {
+		// Seal: the intentional 2s goroutine below outlives the whole -short run of this
+		// package (~50ms), so TestMain's MustCheckLeakedGoroutine flakily reports it as a leak.
+		t.Skip("intentional goroutine leak races TestMain leak check in -short mode")
+	}
 	integration.BeforeTest(t, integration.WithoutGoLeakDetection(), integration.WithoutSkipInShort())
 	// Intentional leak that should get ignored
 	go time.Sleep(2 * time.Second)

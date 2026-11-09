@@ -7,7 +7,7 @@ services: docker
 
 go:
   - "1.16.3"
-  - tip
+  - "1.17.1"
 
 notifications:
   on_success: never
@@ -20,19 +20,14 @@ env:
 
 matrix:
   fast_finish: true
-  allow_failures:
-    - go: "1.16.3"
-      env: TARGET=linux-amd64-coverage
-    - go: tip
-      env: TARGET=linux-amd64-fmt-unit-go-tip-2-cpu
   exclude:
-    - go: tip
+    - go: "1.17.1"
       env: TARGET=linux-amd64-coverage
     - go: "1.16.3"
       env: TARGET=linux-amd64-fmt-unit-go-tip-2-cpu
 
 before_install:
-  - if [[ $TRAVIS_GO_VERSION == 1.* ]]; then docker pull gcr.io/etcd-development/etcd-test:go${TRAVIS_GO_VERSION}; fi
+  - if [[ $TRAVIS_GO_VERSION == 1.* && $TARGET == linux-amd64-coverage ]]; then docker pull gcr.io/etcd-development/etcd-test:go${TRAVIS_GO_VERSION}; fi
 
 install:
   - date
@@ -46,6 +41,11 @@ script:
         sudo HOST_TMP_DIR=/tmp TEST_OPTS="VERBOSE='1'" make docker-test-coverage
         ;;
       linux-amd64-fmt-unit-go-tip-2-cpu)
-        GOARCH=amd64 PASSES='fmt unit' CPU='2' RACE='false' ./test.sh -p=2
+        go build -o tools/etcd-dump-logs/etcd-dump-logs ./tools/etcd-dump-logs
+        GOARCH=amd64 VERBOSE='1' PASSES='unit' CPU='2' RACE='false' ./test.sh -p=2 2>&1 | tee /tmp/unit-test.log | grep --line-buffered -E -B1 '^(ok|FAIL)|--- (FAIL|SKIP)'
+        rc=${PIPESTATUS[0]}
+        awk '/^=== (RUN|CONT) /{cur=$3; next} /^[ \t]+[^ ]+\.go:[0-9]+: /{r=$0; sub(/^[ \t]+/,"",r); reason[cur]=r; next} /--- SKIP: /{n=$3; rr=(n in reason)?reason[n]:"(no reason logged)"; sub(/^[^ ]+\.go:[0-9]+: /,"",rr); cnt[rr]++; names[rr]=names[rr] " " n} END{for(k in cnt) printf "SKIPPED %d test(s), reason [%s]:%s\n", cnt[k], k, names[k]}' /tmp/unit-test.log
+        echo "Unit test summary: passed=$(grep -c -- '--- PASS' /tmp/unit-test.log) failed=$(grep -c -- '--- FAIL' /tmp/unit-test.log) skipped=$(grep -c -- '--- SKIP' /tmp/unit-test.log)"
+        test "${rc}" -eq 0
         ;;
     esac
